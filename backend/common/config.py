@@ -81,6 +81,7 @@ class Settings(BaseSettings):
 
     # Ingestion APIs
     MINERU_BASE_URL: str = "http://mineru:8000"
+    MINERU_PIPELINE_ID: str = ""
 
     # Reference parser provider: llm (default, no extra container) | grobid (high accuracy, needs grobid ~4GB image)
     REFERENCE_PARSER_PROVIDER: str = "llm"

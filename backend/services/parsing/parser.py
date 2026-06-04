@@ -2,18 +2,22 @@
 parse_paper: PDF → doc_blocks (MySQL) + citations (MySQL) + figures (MinIO).
 
 Pipeline:
-  1. MinerU HTTP  — layout parse → blocks (text/table/figure/formula)
-  2. VLM          — figure description (async, per figure block)
-  3. Ref parser   — extract citations from references section
+  1. MinerU KIE SDK — upload PDF, poll for parse/extract results → blocks
+  2. Upload figure images to MinIO figures bucket, backfill image_key
+  3. VLM          — figure description (async, per figure block)
+  4. Ref parser   — extract citations from references section
        llm mode   : LLM reads references text → structured JSON
        grobid mode: POST PDF to GROBID → TEI XML parse (future)
-  4. DB write     — upsert doc_blocks, citations, update papers.status
+  5. DB write     — insert doc_blocks, citations; update papers.status
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import os
 import re
+import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,39 +64,149 @@ def _load_prompt(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Step 1: MinerU parsing
+# Step 1: MinerU KIE SDK parsing
 # ---------------------------------------------------------------------------
+
+def _call_mineru_sync(pdf_path: str) -> dict:
+    """Synchronous wrapper around MineruKIEClient (SDK is sync). Run via asyncio.to_thread."""
+    from mineru_kie_sdk import MineruKIEClient
+
+    client = MineruKIEClient(
+        base_url=settings.MINERU_BASE_URL,
+        pipeline_id=settings.MINERU_PIPELINE_ID,
+        timeout=60,
+    )
+    file_ids = client.upload_file(pdf_path)
+    logger.info(f"[parse] MinerU upload done, file_ids={file_ids}")
+    results = client.get_result(file_ids, timeout=300, poll_interval=5)
+    return results
+
 
 async def _call_mineru(pdf_key: str) -> list[dict]:
     """
-    Call MinerU HTTP API to parse a PDF stored in MinIO.
-    Returns a list of block dicts from MinerU's response.
-    Falls back to empty list on failure (worker will mark task failed upstream).
+    1. Download PDF from MinIO to a temp file.
+    2. Call MinerU KIE SDK (sync, runs in thread pool).
+    3. Normalize the results into a list of raw block dicts.
+    4. Clean up the temp file.
     """
-    url = f"{settings.MINERU_BASE_URL}/parse"
-    async with httpx.AsyncClient(timeout=300) as client:
-        resp = await client.post(url, json={"pdf_key": pdf_key})
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("blocks", [])
+    from common.clients.minio import download_to_tempfile
+
+    tmp_path = await asyncio.to_thread(
+        download_to_tempfile, settings.MINIO_BUCKET_PDF, pdf_key, ".pdf"
+    )
+    try:
+        results = await asyncio.to_thread(_call_mineru_sync, tmp_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    logger.debug(f"[parse] MinerU raw result keys: {list(results.keys())}")
+    return _parse_mineru_results(results)
 
 
-def _mineru_to_blocks(raw_blocks: list[dict]) -> list[Block]:
-    blocks: list[Block] = []
-    for rb in raw_blocks:
-        btype = rb.get("type", "text")
-        blocks.append(Block(
-            block_type=btype,
-            content=rb.get("content", ""),
-            page_num=rb.get("page_num"),
-            bbox=rb.get("bbox"),
-            image_key=rb.get("image_key"),  # MinerU uploads figures to MinIO and returns key
-        ))
+def _parse_mineru_results(results: dict) -> list[dict]:
+    """
+    Normalize MinerU parse/extract results into a uniform block list.
+
+    Block dict schema:
+      type       : str   — text | table | figure | formula
+      content    : str   — plain text / HTML / LaTeX / caption
+      page_num   : int | None
+      bbox       : list | None
+      image_data : bytes | None  — raw image bytes for figure blocks
+    """
+    blocks: list[dict] = []
+
+    parse_data = results.get("parse") or {}
+    # Defensively handle both list-at-root and list-under-"blocks"/"result" key
+    if isinstance(parse_data, list):
+        raw_items = parse_data
+    elif isinstance(parse_data, dict):
+        raw_items = parse_data.get("blocks") or parse_data.get("result") or []
+    else:
+        raw_items = []
+
+    for item in raw_items:
+        btype = item.get("type") or item.get("block_type") or "text"
+        block: dict[str, Any] = {
+            "type": btype,
+            "content": item.get("content") or item.get("text") or "",
+            "page_num": item.get("page_num") or item.get("page"),
+            "bbox": item.get("bbox"),
+            "image_data": None,
+        }
+        if btype == "figure":
+            block["image_data"] = _extract_image_data(item)
+        blocks.append(block)
+
+    if not blocks:
+        logger.warning("[parse] MinerU returned 0 blocks — check pipeline output format")
+
     return blocks
 
 
+def _extract_image_data(item: dict) -> bytes | None:
+    """Extract image bytes from a MinerU figure block (base64 str or raw bytes)."""
+    if b64 := item.get("image_base64") or item.get("img_base64"):
+        try:
+            return base64.b64decode(b64)
+        except Exception:
+            return None
+    if raw := item.get("image_data") or item.get("image"):
+        return raw if isinstance(raw, bytes) else None
+    return None
+
+
+def _mineru_to_blocks(raw_blocks: list[dict]) -> list[Block]:
+    return [
+        Block(
+            block_type=rb["type"],
+            content=rb["content"],
+            page_num=rb.get("page_num"),
+            bbox=rb.get("bbox"),
+        )
+        for rb in raw_blocks
+    ]
+
+
 # ---------------------------------------------------------------------------
-# Step 2: VLM figure descriptions (concurrent)
+# Step 2: Upload figure images to MinIO, backfill block.image_key
+# ---------------------------------------------------------------------------
+
+async def _upload_figures_to_minio(blocks: list[Block], raw_blocks: list[dict]) -> None:
+    """
+    For each figure block that has image_data, upload to MinIO figures bucket
+    and set block.image_key. Runs uploads concurrently.
+    """
+    from common.clients.minio import upload_bytes, ensure_bucket
+
+    await asyncio.to_thread(ensure_bucket, settings.MINIO_BUCKET_FIG)
+
+    async def _upload_one(block: Block, img_data: bytes) -> None:
+        page = block.page_num or 0
+        key = f"{page}/{uuid.uuid4().hex}.png"
+        try:
+            await asyncio.to_thread(upload_bytes, settings.MINIO_BUCKET_FIG, key, img_data, "image/png")
+            block.image_key = key
+        except Exception as e:
+            logger.warning(f"[parse] MinIO figure upload failed: {e}")
+
+    tasks = []
+    for block, raw in zip(blocks, raw_blocks):
+        if block.block_type == "figure":
+            img_data = raw.get("image_data")
+            if img_data:
+                tasks.append(_upload_one(block, img_data))
+
+    if tasks:
+        await asyncio.gather(*tasks)
+        logger.info(f"[parse] uploaded {len(tasks)} figure(s) to MinIO")
+
+
+# ---------------------------------------------------------------------------
+# Step 3: VLM figure descriptions (concurrent)
 # ---------------------------------------------------------------------------
 
 async def _describe_figures(blocks: list[Block]) -> None:
@@ -103,43 +217,38 @@ async def _describe_figures(blocks: list[Block]) -> None:
 
     async def _describe(block: Block) -> None:
         try:
-            # Build a presigned/public URL — MinIO endpoint is accessible from backend container
             image_url = (
                 f"http://{settings.MINIO_ENDPOINT}/{settings.MINIO_BUCKET_FIG}/{block.image_key}"
             )
             block.content_zh = await vlm_describe_image(image_url, caption=block.content)
         except Exception as e:
-            logger.warning(f"VLM figure description failed for {block.image_key}: {e}")
+            logger.warning(f"[parse] VLM description failed for {block.image_key}: {e}")
 
     await asyncio.gather(*[_describe(b) for b in figure_blocks])
 
 
 # ---------------------------------------------------------------------------
-# Step 3a: Reference extraction — LLM mode
+# Step 4a: Reference extraction — LLM mode
 # ---------------------------------------------------------------------------
 
 async def _extract_refs_llm(blocks: list[Block]) -> list[dict]:
     """Find the references section in text blocks and extract via LLM."""
-    # Collect all text content and look for a references section
     full_text = "\n".join(b.content for b in blocks if b.block_type == "text")
 
-    # Heuristic: grab text after the last occurrence of "References" / "Bibliography"
     ref_match = re.search(
         r"\b(?:References|Bibliography|参考文献)\b(.*)$",
         full_text,
         re.DOTALL | re.IGNORECASE,
     )
     if not ref_match:
-        logger.info("No references section found in document text")
+        logger.info("[parse] no references section found")
         return []
 
     references_text = ref_match.group(1).strip()
     if len(references_text) < 50:
         return []
 
-    # Limit to reasonable length to avoid huge prompts
     references_text = references_text[:8000]
-
     prompt_template = _load_prompt("extract_references")
     prompt = prompt_template.format(references_text=references_text)
 
@@ -147,19 +256,18 @@ async def _extract_refs_llm(blocks: list[Block]) -> list[dict]:
         result = await chat_complete_json(prompt, system="You are an academic reference parser.")
         if isinstance(result, list):
             return result
-        # Some models wrap the array in a key
         if isinstance(result, dict):
             for v in result.values():
                 if isinstance(v, list):
                     return v
     except Exception as e:
-        logger.warning(f"LLM reference extraction failed: {e}")
+        logger.warning(f"[parse] LLM reference extraction failed: {e}")
 
     return []
 
 
 # ---------------------------------------------------------------------------
-# Step 3b: Reference extraction — GROBID mode (future)
+# Step 4b: Reference extraction — GROBID mode (future)
 # ---------------------------------------------------------------------------
 
 async def _extract_refs_grobid(pdf_bytes: bytes) -> list[dict]:
@@ -182,7 +290,7 @@ def _parse_tei_references(tei_xml: str) -> list[dict]:
     try:
         root = ET.fromstring(tei_xml)
     except ET.ParseError as e:
-        logger.warning(f"GROBID TEI parse error: {e}")
+        logger.warning(f"[parse] GROBID TEI parse error: {e}")
         return []
 
     refs = []
@@ -226,33 +334,44 @@ async def parse_paper(
     """
     logger.info(f"[parse] paper_id={paper_id} user_id={user_id} provider={settings.REFERENCE_PARSER_PROVIDER}")
 
-    # --- Step 1: MinerU ---
-    raw_blocks = await _call_mineru(pdf_key)
-    blocks = _mineru_to_blocks(raw_blocks)
-    logger.info(f"[parse] MinerU returned {len(blocks)} blocks")
+    try:
+        # --- Step 1: MinerU KIE SDK ---
+        raw_blocks = await _call_mineru(pdf_key)
+        blocks = _mineru_to_blocks(raw_blocks)
+        logger.info(f"[parse] MinerU returned {len(blocks)} blocks")
 
-    # --- Step 2: VLM figure descriptions (concurrent with next steps) ---
-    vlm_task = asyncio.create_task(_describe_figures(blocks))
+        # --- Step 2: Upload figures to MinIO ---
+        await _upload_figures_to_minio(blocks, raw_blocks)
 
-    # --- Step 3: Reference extraction ---
-    if settings.REFERENCE_PARSER_PROVIDER == "grobid":
-        if pdf_bytes is None:
-            logger.warning("[parse] grobid mode requires pdf_bytes, falling back to llm")
-            references = await _extract_refs_llm(blocks)
+        # --- Step 3: VLM figure descriptions + reference extraction (concurrent) ---
+        vlm_task = asyncio.create_task(_describe_figures(blocks))
+
+        if settings.REFERENCE_PARSER_PROVIDER == "grobid":
+            if pdf_bytes is None:
+                logger.warning("[parse] grobid mode requires pdf_bytes, falling back to llm")
+                references = await _extract_refs_llm(blocks)
+            else:
+                references = await _extract_refs_grobid(pdf_bytes)
         else:
-            references = await _extract_refs_grobid(pdf_bytes)
-    else:
-        references = await _extract_refs_llm(blocks)
+            references = await _extract_refs_llm(blocks)
 
-    # Wait for VLM to finish
-    await vlm_task
+        await vlm_task
+        logger.info(f"[parse] extracted {len(references)} references")
 
-    logger.info(f"[parse] extracted {len(references)} references")
+        # --- Step 4: Write to DB ---
+        await _write_blocks(user_id, paper_id, blocks, db)
+        await _write_citations(paper_id, references, db)
+        await _update_paper_status(paper_id, "done", db)
+        await db.commit()
 
-    # --- Step 4: Write to DB ---
-    await _write_blocks(user_id, paper_id, blocks, db)
-    await _write_citations(paper_id, references, db)
-    await db.commit()
+    except Exception as e:
+        logger.error(f"[parse] paper_id={paper_id} failed: {e}")
+        try:
+            await _update_paper_status(paper_id, "failed", db)
+            await db.commit()
+        except Exception:
+            pass
+        raise
 
     return ParseResult(
         paper_id=paper_id,
@@ -271,14 +390,17 @@ async def _write_blocks(user_id: int, paper_id: int, blocks: list[Block], db: As
     for b in blocks:
         await db.execute(
             text("""
-                INSERT INTO doc_blocks (paper_id, user_id, block_type, content, page_num, bbox, image_key)
-                VALUES (:paper_id, :user_id, :block_type, :content, :page_num, :bbox, :image_key)
+                INSERT INTO doc_blocks
+                    (paper_id, user_id, block_type, content, content_zh, page_num, bbox, image_key)
+                VALUES
+                    (:paper_id, :user_id, :block_type, :content, :content_zh, :page_num, :bbox, :image_key)
             """),
             {
                 "paper_id": paper_id,
                 "user_id": user_id,
                 "block_type": b.block_type,
                 "content": b.content,
+                "content_zh": b.content_zh or None,
                 "page_num": b.page_num,
                 "bbox": json.dumps(b.bbox) if b.bbox else None,
                 "image_key": b.image_key,
@@ -300,3 +422,11 @@ async def _write_citations(paper_id: int, references: list[dict], db: AsyncSessi
                 "raw_ref": ref.get("raw_ref", ""),
             },
         )
+
+
+async def _update_paper_status(paper_id: int, status: str, db: AsyncSession) -> None:
+    from sqlalchemy import text
+    await db.execute(
+        text("UPDATE papers SET status = :status WHERE id = :paper_id"),
+        {"status": status, "paper_id": paper_id},
+    )

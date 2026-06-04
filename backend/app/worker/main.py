@@ -4,6 +4,9 @@ from rq import Queue, Worker, Connection
 from common.config import settings
 from common.logging import logger
 
+# Import tasks so RQ worker process can deserialize enqueued jobs
+import app.worker.tasks  # noqa: F401
+
 def start_worker():
     logger.info("Starting ScholarMind RQ Worker...")
     
